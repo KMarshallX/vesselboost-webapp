@@ -115,7 +115,7 @@ vesselboost-webapp/
 
 ## Linting
 
-A syntax checker runs before every GitHub Pages deploy to catch JS errors (e.g. `await` in non-async functions) that would silently break the webapp. You can run it locally:
+A syntax checker runs during release validation to catch JS errors (e.g. `await` in non-async functions) before tagging a production release. You can run it locally:
 
 ```bash
 npm install

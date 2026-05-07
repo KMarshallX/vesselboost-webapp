@@ -37,5 +37,5 @@ Common issues it catches:
 
 ## CI/CD
 
-- **Release workflow** (`.github/workflows/release.yml`): triggers on push to main, auto-bumps version, creates tag + GitHub release
-- **Deploy workflow** (`.github/workflows/deploy-pages.yml`): triggers after release, runs JS syntax lint, builds WASM, deploys to GitHub Pages
+- **Release workflow** (`.github/workflows/release.yml`): manual (`workflow_dispatch`) production release from `main`; validates setup + JS syntax, bumps version, creates tag + GitHub release
+- **Deploy workflow** (`.github/workflows/deploy-pages.yml`): deploys production from the latest release tag and `/staging/` from `main`; builds Rust preprocessing WASM and verifies shipped ONNX/ORT/WASM artifacts
