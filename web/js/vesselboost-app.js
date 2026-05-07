@@ -14,6 +14,13 @@ import { ModalManager } from './modules/ui/ModalManager.js';
 import * as Config from './app/config.js';
 import { generateNiivueColormap, getLabelName } from './app/labels.js';
 import { computeAutoWindow } from './modules/ui/percentile.js';
+import {
+  buildResultVolumeStack,
+  defaultResultVisibility,
+  getResultDisplay,
+  isImageResultStage,
+  isResultStageVisible
+} from './modules/ui/result-display.js';
 
 class VesselBoostApp {
   constructor() {
@@ -38,6 +45,12 @@ class VesselBoostApp {
     this._inputVisible = true;
     this._overlaySliderValue = 0.5;
     this._segmentationVisible = true;
+    this.viewerLayerVisibility = {
+      image: true,
+      vessels: true,
+      brainmask: false
+    };
+    this.resultStageVisibility = {};
     this._lastLocationData = null;
 
     this.init();
@@ -72,7 +85,16 @@ class VesselBoostApp {
       onInitialized: () => this.onWorkerInitialized(),
       onStepComplete: (step) => this.onStepComplete(step),
       onVolumeInfo: (info) => this.onVolumeInfo(info),
-      onBrainMaskOverlay: (file) => { this._brainMaskOverlayFile = file; }
+      onBrainMaskOverlay: (file) => {
+        this._brainMaskOverlayFile = file;
+        this.ensureResultStageVisibility('brainmask');
+        if (this.isResultStageVisible('brainmask')) {
+          void this.renderVisibleResults();
+        }
+        this.rebuildResultsList();
+        this.refreshResultsSection();
+        this.refreshViewerLayerControls();
+      }
     });
 
     // Modals
@@ -120,9 +142,10 @@ class VesselBoostApp {
 
   getOverlayLabelText(data) {
     if (!this._segmentationVisible) return '';
-    if (!this.nv?.volumes || this.nv.volumes.length < 2) return '';
+    const segmentationIndex = this.viewerController?.getVolumeIndexForStage('segmentation');
+    if (segmentationIndex === null || segmentationIndex === undefined) return '';
 
-    const rawValue = data?.values?.[1]?.value;
+    const rawValue = data?.values?.[segmentationIndex]?.value;
     if (!Number.isFinite(rawValue)) return '';
 
     const labelIndex = Math.round(rawValue);
@@ -219,7 +242,7 @@ class VesselBoostApp {
         const val = parseFloat(e.target.value);
         this._overlaySliderValue = val;
         if (this._segmentationVisible) {
-          this.viewerController.setOverlayOpacity(val);
+          this.viewerController.setStageOpacity('segmentation', val, { apply: true, redraw: true });
         }
         const display = document.getElementById('overlayOpacityValue');
         if (display) display.textContent = `${Math.round(val * 100)}%`;
@@ -227,6 +250,7 @@ class VesselBoostApp {
     }
 
     this.setupWindowControls();
+    this.bindPipelineInvalidationControls();
 
     const interpToggle = document.getElementById('interpolation');
     if (interpToggle) {
@@ -332,6 +356,84 @@ class VesselBoostApp {
         tooltip.style.display = 'none';
       });
     });
+  }
+
+  bindPipelineInvalidationControls() {
+    const bind = (id, step, eventName = 'change') => {
+      const el = document.getElementById(id);
+      if (!el) return;
+      el.addEventListener(eventName, () => this.invalidatePipelineFrom(step));
+    };
+
+    bind('downsampleFactor', 'downsample');
+    bind('denoiseMethodSelect', 'denoise');
+    bind('modelSelect', 'inference');
+    bind('overlapSelect', 'inference');
+    bind('thresholdInput', 'inference', 'input');
+    bind('minSizeInput', 'inference', 'input');
+    bind('betMethodSelect', 'bet');
+    bind('betFiInput', 'bet', 'input');
+  }
+
+  invalidatePipelineFrom(step) {
+    if (this.inferenceExecutor.isRunning()) return;
+    if (!this.inputFile) return;
+    if (!this.isStepEnabled(step) && this.inferenceExecutor.getStepStatus(step) === 'pending') return;
+    const invalidated = this.inferenceExecutor.invalidateFromStep(step, { includeSelf: true });
+    if (!invalidated.nodes.length && !invalidated.stages.length) return;
+    this.applyInvalidationToUI(invalidated, step);
+  }
+
+  applyInvalidationToUI(invalidated, changedStep) {
+    for (const stage of invalidated.stages) {
+      delete this.resultStageVisibility[stage];
+    }
+
+    for (const node of invalidated.nodes) {
+      if (!Config.PIPELINE_STEPS.includes(node)) continue;
+      if (node === changedStep) {
+        this.updateStepBadge(node, 'pending');
+        this.setStepButtonsEnabled(node, true);
+        this.setStepEnabled(node, true);
+      } else {
+        this.updateStepBadge(node, '');
+        this.setStepButtonsEnabled(node, false);
+        this.setStepEnabled(node, false);
+      }
+      this.setStepAbortVisible(node, false);
+    }
+
+    if (invalidated.stages.includes('segmentation')) {
+      this._segmentationVisible = true;
+      const overlayControl = document.getElementById('overlayControl');
+      if (overlayControl) overlayControl.classList.add('hidden');
+    }
+    if (invalidated.stages.includes('bet') || invalidated.stages.includes('brainmask')) {
+      const applyGroup = document.getElementById('applyBETGroup');
+      if (applyGroup) applyGroup.classList.add('hidden');
+    }
+
+    this.rebuildResultsList();
+    this.refreshResultsSection();
+    this.refreshViewerLayerControls();
+    void this.renderVisibleResults();
+  }
+
+  refreshResultsSection() {
+    const resultsSection = document.getElementById('resultsSection');
+    if (!resultsSection) return;
+    if (this.inferenceExecutor.getStageOrder().length > 0) {
+      resultsSection.classList.remove('hidden');
+      resultsSection.classList.remove('collapsed');
+    } else {
+      resultsSection.classList.add('hidden');
+      resultsSection.classList.add('collapsed');
+    }
+  }
+
+  refreshViewerLayerControls() {
+    // The visible control surface is the Results stage list. This no-op keeps
+    // stage refresh call sites compact while avoiding a duplicate toggle strip.
   }
 
   // ==================== Viewer Controls ====================
@@ -542,13 +644,15 @@ class VesselBoostApp {
     await this.resetForNewFile();
     this.inputFile = file;
     this._inputVisible = true;
-    await this.viewerController.loadBaseVolume(file);
+    const inputData = await file.arrayBuffer();
+    this.inferenceExecutor.setSourceFile(file, inputData.slice(0));
+    await this.viewerController.loadBaseVolume(file, { stage: 'input', visible: true });
     this.applyDefaultBaseColormap();
     this.syncWindowControls();
     this.applyAutoContrast();
+    this.refreshViewerLayerControls();
 
     // Send data to worker for loading
-    const inputData = await file.arrayBuffer();
     this.setStepRunning('load');
     await this.inferenceExecutor.loadVolume(inputData);
   }
@@ -564,6 +668,8 @@ class VesselBoostApp {
     this.abortUICheckpoint = null;
     this._inputVisible = true;
     this._segmentationVisible = true;
+    this.viewerLayerVisibility = { image: true, vessels: true, brainmask: false };
+    this.resultStageVisibility = {};
     this._overlaySliderValue = 0.5;
     this._lastLocationData = null;
 
@@ -598,6 +704,7 @@ class VesselBoostApp {
       currentResultTab: this.currentResultTab || 'input',
       inputVisible: this._inputVisible,
       segmentationVisible: this._segmentationVisible,
+      resultStageVisibility: { ...this.resultStageVisibility },
       overlaySliderValue: this._overlaySliderValue
     };
   }
@@ -676,6 +783,7 @@ class VesselBoostApp {
 
     this.currentResultTab = checkpoint?.currentResultTab || 'input';
     this._segmentationVisible = checkpoint?.segmentationVisible ?? true;
+    this.resultStageVisibility = { ...(checkpoint?.resultStageVisibility || this.resultStageVisibility) };
     this._overlaySliderValue = checkpoint?.overlaySliderValue ?? 0.5;
 
     this.rebuildResultsList();
@@ -684,7 +792,9 @@ class VesselBoostApp {
       ? this.currentResultTab
       : 'input';
 
-    if (this.inputFile && targetStage) {
+    if (targetStage !== 'input') {
+      await this.renderVisibleResults();
+    } else if (this.inputFile && targetStage) {
       await this.viewStage(targetStage);
     }
 
@@ -700,9 +810,9 @@ class VesselBoostApp {
     if (opacityDisplay) opacityDisplay.textContent = `${Math.round(this._overlaySliderValue * 100)}%`;
 
     if (this._segmentationVisible) {
-      this.viewerController.setOverlayOpacity(this._overlaySliderValue);
+      this.viewerController.setStageOpacity('segmentation', this._overlaySliderValue, { apply: true, redraw: true });
     } else {
-      this.viewerController.setOverlayOpacity(0);
+      this.viewerController.setStageVisible('segmentation', false);
     }
 
     const statusText = document.getElementById('statusText');
@@ -726,17 +836,22 @@ class VesselBoostApp {
     if (this.inferenceExecutor.isRunning()) return;
     const factorSelect = document.getElementById('downsampleFactor');
     const factor = factorSelect ? parseInt(factorSelect.value) : 2;
+    const invalidated = this.inferenceExecutor.invalidateFromStep('downsample', { includeSelf: true });
+    this.applyInvalidationToUI(invalidated, 'downsample');
     this.setStepRunning('downsample');
     await this.inferenceExecutor.downsample(factor);
   }
 
   async skipDownsample() {
     if (this.inferenceExecutor.isRunning()) return;
-    // Remove downsample result and restore viewer to input
-    this.inferenceExecutor.removeResult('downsample');
+    const invalidated = this.inferenceExecutor.invalidateFromStep('downsample', { includeSelf: true });
+    this.applyInvalidationToUI(invalidated, 'downsample');
     this.inferenceExecutor.skipDownsample();
     if (this.inputFile) {
-      await this.viewerController.loadBaseVolume(this.inputFile);
+      await this.viewerController.loadBaseVolume(this.inputFile, {
+        stage: 'input',
+        visible: this.viewerLayerVisibility.image !== false
+      });
       this.currentResultTab = 'input';
       this._inputVisible = true;
       this.applyDefaultBaseColormap();
@@ -748,21 +863,24 @@ class VesselBoostApp {
   async runN4() {
     if (this.inferenceExecutor.isRunning()) return;
     this.beginAbortableStep('n4');
+    const invalidated = this.inferenceExecutor.invalidateFromStep('n4', { includeSelf: true });
+    this.applyInvalidationToUI(invalidated, 'n4');
     this.setStepRunning('n4');
-    this.inferenceExecutor.resetDownstream('n4');
-    this.resetUIDownstream('n4');
     await this.inferenceExecutor.runN4();
   }
 
   async skipN4() {
     if (this.inferenceExecutor.isRunning()) return;
-    // Remove N4 result and restore viewer to downsample result or input
-    this.inferenceExecutor.removeResult('n4');
+    const invalidated = this.inferenceExecutor.invalidateFromStep('n4', { includeSelf: true });
+    this.applyInvalidationToUI(invalidated, 'n4');
     this.inferenceExecutor.skipN4();
     const downsampleResult = this.inferenceExecutor.getResult('downsample');
     const baseFile = downsampleResult?.file || this.inputFile;
     if (baseFile) {
-      await this.viewerController.loadBaseVolume(baseFile);
+      await this.viewerController.loadBaseVolume(baseFile, {
+        stage: downsampleResult?.file ? 'downsample' : 'input',
+        visible: this.viewerLayerVisibility.image !== false
+      });
       this.currentResultTab = downsampleResult?.file ? 'downsample' : 'input';
       this._inputVisible = true;
       this.applyDefaultBaseColormap();
@@ -778,6 +896,8 @@ class VesselBoostApp {
     const betFiInput = document.getElementById('betFiInput');
     const fi = betFiInput ? parseFloat(betFiInput.value) : 0.5;
     this.beginAbortableStep('bet');
+    const invalidated = this.inferenceExecutor.invalidateFromStep('bet', { includeSelf: true });
+    this.applyInvalidationToUI(invalidated, 'bet');
     this.setStepRunning('bet');
     const modelBaseUrl = new URL(Config.MODEL_BASE_URL, window.location.href).href;
     await this.inferenceExecutor.runBET(fi, method, modelBaseUrl);
@@ -785,8 +905,8 @@ class VesselBoostApp {
 
   async skipBET() {
     if (this.inferenceExecutor.isRunning()) return;
-    // Remove BET result and let onStepComplete('bet') restore the segmentation view
-    this.inferenceExecutor.removeResult('bet');
+    const invalidated = this.inferenceExecutor.invalidateFromStep('bet', { includeSelf: true });
+    this.applyInvalidationToUI(invalidated, 'bet');
     this.inferenceExecutor.skipBET();
   }
 
@@ -816,23 +936,26 @@ class VesselBoostApp {
     const methodSelect = document.getElementById('denoiseMethodSelect');
     const method = methodSelect ? methodSelect.value : 'bilateral';
     this.beginAbortableStep('denoise');
+    const invalidated = this.inferenceExecutor.invalidateFromStep('denoise', { includeSelf: true });
+    this.applyInvalidationToUI(invalidated, 'denoise');
     this.setStepRunning('denoise');
-    this.inferenceExecutor.resetDownstream('denoise');
-    this.resetUIDownstream('denoise');
     await this.inferenceExecutor.runDenoise(method);
   }
 
   async skipDenoise() {
     if (this.inferenceExecutor.isRunning()) return;
-    // Remove denoise result and restore viewer
-    this.inferenceExecutor.removeResult('nlm');
+    const invalidated = this.inferenceExecutor.invalidateFromStep('denoise', { includeSelf: true });
+    this.applyInvalidationToUI(invalidated, 'denoise');
     this.inferenceExecutor.skipDenoise();
     // Reload the latest preprocessing base (N4 > downsample > input)
     const n4Result = this.inferenceExecutor.getResult('n4');
     const downsampleResult = this.inferenceExecutor.getResult('downsample');
     const baseFile = n4Result?.file || downsampleResult?.file || this.inputFile;
     if (baseFile) {
-      await this.viewerController.loadBaseVolume(baseFile);
+      await this.viewerController.loadBaseVolume(baseFile, {
+        stage: n4Result?.file ? 'n4' : (downsampleResult?.file ? 'downsample' : 'input'),
+        visible: this.viewerLayerVisibility.image !== false
+      });
       this.currentResultTab = n4Result?.file ? 'n4' : (downsampleResult?.file ? 'downsample' : 'input');
       this._inputVisible = true;
       this.applyDefaultBaseColormap();
@@ -861,9 +984,8 @@ class VesselBoostApp {
     const modelBaseUrl = new URL(Config.MODEL_BASE_URL, window.location.href).href;
     this.beginAbortableStep('inference');
 
-    // Clear previous results
-    this.inferenceExecutor.clearResults();
-    this.disableAllResultTabs();
+    const invalidated = this.inferenceExecutor.invalidateFromStep('inference', { includeSelf: true });
+    this.applyInvalidationToUI(invalidated, 'inference');
 
     this.setStepRunning('inference');
     await this.inferenceExecutor.runInference({
@@ -1141,12 +1263,25 @@ class VesselBoostApp {
           const downsampleResult = this.inferenceExecutor.getResult('downsample');
           const betBaseFile = downsampleResult?.file || this.inputFile;
           if (segFile && betBaseFile) {
-            await this.viewerController.showResultAsOverlay(betBaseFile, segFile, 'red');
+            await this.viewerController.loadVolumeStack([
+              {
+                file: betBaseFile,
+                stage: downsampleResult?.file ? 'downsample' : 'input',
+                visible: this.viewerLayerVisibility.image !== false
+              },
+              {
+                file: segFile,
+                colormap: 'vesselboost',
+                opacity: 1.0,
+                stage: 'segmentation',
+                visible: this.viewerLayerVisibility.vessels !== false
+              }
+            ]);
             this._inputVisible = false;
             this.viewerController.setBaseOpacity(0);
             this._segmentationVisible = true;
             this._overlaySliderValue = 1.0;
-            this.viewerController.setOverlayOpacity(1.0);
+            this.viewerController.setStageOpacity('segmentation', 1.0, { apply: true, redraw: true });
             const opacitySlider = document.getElementById('overlayOpacity');
             if (opacitySlider) opacitySlider.value = 1.0;
             const opacityDisplay = document.getElementById('overlayOpacityValue');
@@ -1158,7 +1293,11 @@ class VesselBoostApp {
           const betResult = this.inferenceExecutor.getResult('bet');
           const segResult = this.inferenceExecutor.getResult('segmentation');
           if (betResult?.file) {
-            await this.viewerController.loadBaseVolume(betResult.file);
+            this.setExclusiveVisibleImageStage('bet');
+            await this.viewerController.loadBaseVolume(betResult.file, {
+              stage: 'bet',
+              visible: this.viewerLayerVisibility.image !== false
+            });
             this.currentResultTab = 'bet';
             this._inputVisible = true;
             this.applyDefaultBaseColormap();
@@ -1166,7 +1305,10 @@ class VesselBoostApp {
             this.applyAutoContrast();
             // Overlay segmentation on the brain-extracted image
             if (segResult?.file) {
-              await this.viewerController.loadOverlay(segResult.file, 'red', 0.5);
+              await this.viewerController.loadOverlay(segResult.file, 'vesselboost', 0.5, {
+                stage: 'segmentation',
+                visible: this.viewerLayerVisibility.vessels !== false
+              });
               this._segmentationVisible = true;
               this._overlaySliderValue = 0.5;
               const opacitySlider = document.getElementById('overlayOpacity');
@@ -1183,6 +1325,7 @@ class VesselBoostApp {
           const erodeBtn = document.getElementById('erodeBETBtn');
           if (erodeBtn) erodeBtn.disabled = false;
         }
+        await this.renderVisibleResults();
         this.rebuildResultsList();
         break;
       }
@@ -1191,14 +1334,20 @@ class VesselBoostApp {
         const betResult = this.inferenceExecutor.getResult('bet');
         const segResult = this.inferenceExecutor.getResult('segmentation');
         if (betResult?.file) {
-          await this.viewerController.loadBaseVolume(betResult.file);
+          await this.viewerController.loadBaseVolume(betResult.file, {
+            stage: 'bet',
+            visible: this.viewerLayerVisibility.image !== false
+          });
           this.currentResultTab = 'bet';
           this._inputVisible = true;
           this.applyDefaultBaseColormap();
           this.syncWindowControls();
           this.applyAutoContrast();
           if (segResult?.file) {
-            await this.viewerController.loadOverlay(segResult.file, 'red', 0.5);
+            await this.viewerController.loadOverlay(segResult.file, 'vesselboost', 0.5, {
+              stage: 'segmentation',
+              visible: this.viewerLayerVisibility.vessels !== false
+            });
             this._segmentationVisible = true;
             this._overlaySliderValue = 0.5;
             const opacitySlider = document.getElementById('overlayOpacity');
@@ -1215,6 +1364,8 @@ class VesselBoostApp {
         if (erodeBtn) erodeBtn.disabled = false;
         const applyBtn = document.getElementById('applyBETBtn');
         if (applyBtn) applyBtn.disabled = false;
+        await this.renderVisibleResults();
+        this.rebuildResultsList();
         break;
       }
       case 'dilate-brain-mask': {
@@ -1222,14 +1373,20 @@ class VesselBoostApp {
         const betResult = this.inferenceExecutor.getResult('bet');
         const segResult = this.inferenceExecutor.getResult('segmentation');
         if (betResult?.file) {
-          await this.viewerController.loadBaseVolume(betResult.file);
+          await this.viewerController.loadBaseVolume(betResult.file, {
+            stage: 'bet',
+            visible: this.viewerLayerVisibility.image !== false
+          });
           this.currentResultTab = 'bet';
           this._inputVisible = true;
           this.applyDefaultBaseColormap();
           this.syncWindowControls();
           this.applyAutoContrast();
           if (segResult?.file) {
-            await this.viewerController.loadOverlay(segResult.file, 'red', 0.5);
+            await this.viewerController.loadOverlay(segResult.file, 'vesselboost', 0.5, {
+              stage: 'segmentation',
+              visible: this.viewerLayerVisibility.vessels !== false
+            });
             this._segmentationVisible = true;
             this._overlaySliderValue = 0.5;
             const opacitySlider = document.getElementById('overlayOpacity');
@@ -1244,6 +1401,8 @@ class VesselBoostApp {
         if (erodeBtn) erodeBtn.disabled = false;
         const applyBtn = document.getElementById('applyBETBtn');
         if (applyBtn) applyBtn.disabled = false;
+        await this.renderVisibleResults();
+        this.rebuildResultsList();
         break;
       }
       case 'erode-brain-mask': {
@@ -1251,14 +1410,20 @@ class VesselBoostApp {
         const betResult = this.inferenceExecutor.getResult('bet');
         const segResult = this.inferenceExecutor.getResult('segmentation');
         if (betResult?.file) {
-          await this.viewerController.loadBaseVolume(betResult.file);
+          await this.viewerController.loadBaseVolume(betResult.file, {
+            stage: 'bet',
+            visible: this.viewerLayerVisibility.image !== false
+          });
           this.currentResultTab = 'bet';
           this._inputVisible = true;
           this.applyDefaultBaseColormap();
           this.syncWindowControls();
           this.applyAutoContrast();
           if (segResult?.file) {
-            await this.viewerController.loadOverlay(segResult.file, 'red', 0.5);
+            await this.viewerController.loadOverlay(segResult.file, 'vesselboost', 0.5, {
+              stage: 'segmentation',
+              visible: this.viewerLayerVisibility.vessels !== false
+            });
             this._segmentationVisible = true;
             this._overlaySliderValue = 0.5;
             const opacitySlider = document.getElementById('overlayOpacity');
@@ -1273,6 +1438,8 @@ class VesselBoostApp {
         if (erodeBtnE) erodeBtnE.disabled = false;
         const applyBtnE = document.getElementById('applyBETBtn');
         if (applyBtnE) applyBtnE.disabled = false;
+        await this.renderVisibleResults();
+        this.rebuildResultsList();
         break;
       }
     }
@@ -1348,7 +1515,7 @@ class VesselBoostApp {
   }
 
   resetUIDownstream(fromStep) {
-    const steps = ['n4', 'bet', 'denoise', 'inference'];
+    const steps = ['downsample', 'n4', 'denoise', 'inference', 'bet'];
     const idx = steps.indexOf(fromStep);
     if (idx < 0) return;
 
@@ -1370,27 +1537,143 @@ class VesselBoostApp {
       resultsSection.classList.remove('collapsed');
     }
 
-    // For preprocessing stages, load as base volume in viewer
-    if (data.stage !== 'segmentation') {
-      const result = this.inferenceExecutor.getResult(data.stage);
-      if (result?.file) {
-        await this.viewerController.loadBaseVolume(result.file);
-        this.currentResultTab = data.stage;
-        this._inputVisible = true;
-        this.applyDefaultBaseColormap();
-        this.syncWindowControls();
-        this.applyAutoContrast();
-      }
+    this.ensureResultStageVisibility(data.stage);
+    if (isImageResultStage(data.stage)) {
+      this.setExclusiveVisibleImageStage(data.stage);
+    } else if (data.stage === 'segmentation') {
+      this.setResultStageVisibleState('segmentation', true);
     }
 
-    // Rebuild the results list with all available stages
+    await this.renderVisibleResults();
     this.rebuildResultsList();
 
-    // Show overlay controls when segmentation arrives
     if (data.stage === 'segmentation') {
       const overlayControl = document.getElementById('overlayControl');
       if (overlayControl) overlayControl.classList.remove('hidden');
     }
+    this.refreshViewerLayerControls();
+  }
+
+  ensureResultStageVisibility(stage) {
+    if (!getResultDisplay(stage)) return;
+    if (!Object.prototype.hasOwnProperty.call(this.resultStageVisibility, stage)) {
+      this.setResultStageVisibleState(stage, defaultResultVisibility(stage));
+    }
+  }
+
+  setResultStageVisibleState(stage, visible) {
+    if (!getResultDisplay(stage)) return;
+    this.resultStageVisibility[stage] = !!visible;
+    if (stage === 'segmentation') {
+      this._segmentationVisible = !!visible;
+      this.viewerLayerVisibility.vessels = !!visible;
+    }
+    if (stage === 'brainmask') {
+      this.viewerLayerVisibility.brainmask = !!visible;
+    }
+  }
+
+  setExclusiveVisibleImageStage(stage) {
+    if (!isImageResultStage(stage)) return;
+    for (const resultStage of this.inferenceExecutor.getStageOrder()) {
+      if (isImageResultStage(resultStage)) {
+        this.setResultStageVisibleState(resultStage, resultStage === stage);
+      }
+    }
+    this.setResultStageVisibleState(stage, true);
+    this.currentResultTab = stage;
+    this._inputVisible = true;
+    this.viewerLayerVisibility.image = true;
+  }
+
+  isResultStageVisible(stage) {
+    return isResultStageVisible(stage, this.resultStageVisibility);
+  }
+
+  async setResultStageVisible(stage, visible) {
+    this.ensureResultStageVisibility(stage);
+    this.setResultStageVisibleState(stage, visible);
+    if (visible && isImageResultStage(stage)) {
+      this.currentResultTab = stage;
+      this._inputVisible = true;
+      this.viewerLayerVisibility.image = true;
+    }
+    await this.renderVisibleResults();
+    this.rebuildResultsList();
+    this.refreshViewerLayerControls();
+  }
+
+  async renderVisibleResults() {
+    const stages = this.inferenceExecutor.getStageOrder();
+    const results = this.inferenceExecutor.getResults();
+    const stack = buildResultVolumeStack({
+      stages,
+      results,
+      visibility: this.resultStageVisibility,
+      preferredBaseStage: this.currentResultTab,
+      segmentationOpacity: this._overlaySliderValue
+    });
+
+    if (!stack.length) {
+      if (stages.some(stage => getResultDisplay(stage) && results[stage]?.file)) {
+        this.viewerController.clearVolumes();
+        this._inputVisible = false;
+      }
+      this.updateOverlayControlState();
+      this.updateResultButtonStates();
+      this.updateViewerInfo(this._lastLocationData);
+      return false;
+    }
+
+    const ok = await this.viewerController.loadVolumeStack(stack);
+    if (!ok) return false;
+
+    const baseEntry = stack[0];
+    if (isImageResultStage(baseEntry.stage)) {
+      this.currentResultTab = baseEntry.stage;
+      this._inputVisible = baseEntry.visible !== false;
+      this.viewerLayerVisibility.image = this._inputVisible;
+      if (baseEntry.visible !== false) {
+        this.applyDefaultBaseColormap();
+        this.syncWindowControls();
+        this.applyAutoContrast();
+      }
+    } else {
+      this._inputVisible = true;
+    }
+
+    this._segmentationVisible = this.isResultStageVisible('segmentation');
+    this.viewerLayerVisibility.vessels = this._segmentationVisible;
+    this.viewerLayerVisibility.brainmask = this.isResultStageVisible('brainmask');
+    this.updateOverlayControlState();
+    this.updateResultButtonStates();
+    this.updateViewerInfo(this._lastLocationData);
+    return true;
+  }
+
+  updateOverlayControlState() {
+    const hasSegmentation = !!this.inferenceExecutor.getResult('segmentation');
+    const overlayControl = document.getElementById('overlayControl');
+    if (overlayControl) overlayControl.classList.toggle('hidden', !hasSegmentation);
+
+    const opacitySlider = document.getElementById('overlayOpacity');
+    if (opacitySlider) {
+      opacitySlider.disabled = !hasSegmentation || !this.isResultStageVisible('segmentation');
+      opacitySlider.value = String(this._overlaySliderValue);
+    }
+
+    const opacityDisplay = document.getElementById('overlayOpacityValue');
+    if (opacityDisplay) opacityDisplay.textContent = `${Math.round(this._overlaySliderValue * 100)}%`;
+  }
+
+  updateResultButtonStates() {
+    const container = document.getElementById('stageButtons');
+    if (!container) return;
+    container.querySelectorAll('.view-btn').forEach(btn => {
+      const stage = btn.dataset.stage;
+      btn.classList.toggle('active', this.isResultStageVisible(stage));
+      btn.title = `${this.isResultStageVisible(stage) ? 'Hide' : 'Show'} ${Config.STAGE_NAMES[stage] || stage}`;
+    });
   }
 
   rebuildResultsList() {
@@ -1406,38 +1689,21 @@ class VesselBoostApp {
     const allStages = [...stages];
 
     for (const stage of allStages) {
+      if (!getResultDisplay(stage)) continue;
+      this.ensureResultStageVisibility(stage);
+
       const row = document.createElement('div');
       row.className = 'volume-toggle';
 
       const viewBtn = document.createElement('button');
       viewBtn.className = 'view-btn';
-      viewBtn.title = `View ${Config.STAGE_NAMES[stage] || stage}`;
+      viewBtn.title = `${this.isResultStageVisible(stage) ? 'Hide' : 'Show'} ${Config.STAGE_NAMES[stage] || stage}`;
       viewBtn.innerHTML = viewSvg;
       viewBtn.dataset.stage = stage;
-
-      if (stage === 'segmentation') {
-        // Segmentation eye toggles overlay visibility
-        viewBtn.classList.toggle('active', this._segmentationVisible);
-        viewBtn.addEventListener('click', () => {
-          this._segmentationVisible = !this._segmentationVisible;
-          this.toggleOverlayVisibility(this._segmentationVisible);
-          viewBtn.classList.toggle('active', this._segmentationVisible);
-        });
-      } else {
-        // Initialize active state based on what's currently displayed
-        viewBtn.classList.toggle('active', this.currentResultTab === stage && this._inputVisible);
-        // Base volume stages: toggle load/unload as base volume
-        viewBtn.addEventListener('click', () => {
-          if (this.currentResultTab === stage && this._inputVisible) {
-            // Already showing this stage — hide it
-            this._inputVisible = false;
-            this.viewerController.setBaseOpacity(0);
-            viewBtn.classList.remove('active');
-          } else {
-            this.viewStage(stage);
-          }
-        });
-      }
+      viewBtn.classList.toggle('active', this.isResultStageVisible(stage));
+      viewBtn.addEventListener('click', () => {
+        this.setResultStageVisible(stage, !this.isResultStageVisible(stage));
+      });
       row.appendChild(viewBtn);
 
       const label = document.createElement('span');
@@ -1460,36 +1726,8 @@ class VesselBoostApp {
   }
 
   async viewStage(stage) {
-    const result = this.inferenceExecutor.getResult(stage);
-    const file = result?.file;
-    if (!file) return;
-
-    await this.viewerController.loadBaseVolume(file);
-    this.currentResultTab = stage;
-    this._inputVisible = true;
-    this.applyDefaultBaseColormap();
-    this.syncWindowControls();
-    this.applyAutoContrast();
-
-    // Re-add segmentation overlay if it exists and is visible
-    if (this._segmentationVisible) {
-      const segResult = this.inferenceExecutor.getResult('segmentation');
-      if (segResult?.file) {
-        await this.viewerController.loadOverlay(segResult.file, 'red', this._overlaySliderValue);
-      }
-    }
-
-    // Update active state on view buttons
-    const container = document.getElementById('stageButtons');
-    if (container) {
-      container.querySelectorAll('.view-btn').forEach(btn => {
-        if (btn.dataset.stage === 'segmentation') {
-          btn.classList.toggle('active', this._segmentationVisible);
-        } else {
-          btn.classList.toggle('active', btn.dataset.stage === stage);
-        }
-      });
-    }
+    if (!this.inferenceExecutor.getResult(stage)?.file) return;
+    await this.setResultStageVisible(stage, true);
   }
 
   toggleInputVisibility(visible) {
@@ -1498,16 +1736,7 @@ class VesselBoostApp {
   }
 
   toggleOverlayVisibility(visible) {
-    this._segmentationVisible = visible;
-    const opacitySlider = document.getElementById('overlayOpacity');
-    if (visible) {
-      this.viewerController.setOverlayOpacity(this._overlaySliderValue);
-      if (opacitySlider) opacitySlider.disabled = false;
-    } else {
-      this.viewerController.setOverlayOpacity(0);
-      if (opacitySlider) opacitySlider.disabled = true;
-    }
-    this.updateViewerInfo(this._lastLocationData);
+    this.setResultStageVisible('segmentation', visible);
   }
 
   onWorkerInitialized() {
@@ -1531,21 +1760,12 @@ class VesselBoostApp {
     this.abortUICheckpoint = null;
     if (statusText) statusText.textContent = 'Ready';
 
-    // Show segmentation overlay on top of the input volume
     const fullResult = this.inferenceExecutor.getResult('segmentation');
-    const overlayFile = fullResult?.file;
-    if (overlayFile) {
-      // Load segmentation as overlay on top of existing base volume
-      await this.viewerController.loadOverlay(overlayFile, 'red');
-
-      // Set overlay to 50% so input remains visible underneath
+    if (fullResult?.file) {
       this._overlaySliderValue = 0.5;
-      this.viewerController.setOverlayOpacity(0.5);
-      const opacitySlider = document.getElementById('overlayOpacity');
-      if (opacitySlider) opacitySlider.value = 0.5;
-      const opacityDisplay = document.getElementById('overlayOpacityValue');
-      if (opacityDisplay) opacityDisplay.textContent = '50%';
-      this.syncWindowControls();
+      this.setResultStageVisibleState('segmentation', true);
+      await this.renderVisibleResults();
+      this.rebuildResultsList();
     }
   }
 
@@ -1569,6 +1789,7 @@ class VesselBoostApp {
   disableAllResultTabs() {
     const container = document.getElementById('stageButtons');
     if (container) container.innerHTML = '';
+    this.resultStageVisibility = {};
     this._segmentationVisible = true;
     this._overlaySliderValue = 0.5;
   }
@@ -1578,6 +1799,8 @@ class VesselBoostApp {
     this.disableAllResultTabs();
     this.currentResultTab = 'input';
     this._inputVisible = true;
+    this.viewerLayerVisibility = { image: true, vessels: true, brainmask: false };
+    this.resultStageVisibility = {};
 
     const resultsSection = document.getElementById('resultsSection');
     if (resultsSection) {
@@ -1600,10 +1823,14 @@ class VesselBoostApp {
     if (opacityDisplay) opacityDisplay.textContent = '50%';
 
     if (this.inputFile) {
-      this.viewerController.loadBaseVolume(this.inputFile);
+      this.viewerController.loadBaseVolume(this.inputFile, {
+        stage: 'input',
+        visible: this.viewerLayerVisibility.image !== false
+      });
     }
 
     this.updateViewerInfo(this._lastLocationData);
+    this.refreshViewerLayerControls();
   }
 
   // ==================== UI Helpers ====================

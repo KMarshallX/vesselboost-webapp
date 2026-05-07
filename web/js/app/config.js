@@ -91,6 +91,7 @@ export const STAGE_NAMES = {
   'input': 'Input',
   'downsample': 'Downsample',
   'bet': 'Brain Extraction',
+  'brainmask': 'Brain Mask',
   'n4': 'Bias Correction',
   'nlm': 'Denoising',
   'segmentation': 'Segmentation'

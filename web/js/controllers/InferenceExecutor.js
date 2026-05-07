@@ -6,6 +6,14 @@
  */
 
 import { VERSION } from '../app/config.js';
+import { PipelineGraph } from '../modules/pipeline/PipelineGraph.js';
+import {
+  analysisVolumeSpace,
+  readNiftiSpatialMetadata,
+  spatialGridId,
+  tagSpatialFile,
+  VOLUME_SPACES
+} from '../modules/spatial-file.js';
 
 export class InferenceExecutor {
   constructor(options) {
@@ -34,6 +42,9 @@ export class InferenceExecutor {
     this.hiddenArtifacts = this._createEmptyHiddenArtifacts();
     this.restoreStateResolve = null;
     this.restoreStateReject = null;
+    this.graph = new PipelineGraph();
+    this.currentStepParams = {};
+    this.sourceSpatial = null;
 
     // Step status tracking
     this.stepStatus = {
@@ -54,6 +65,7 @@ export class InferenceExecutor {
   getResult(stage) { return this.results[stage] || null; }
   getResults() { return this.results; }
   getStageOrder() { return this.stageOrder; }
+  getPipelineGraph() { return this.graph; }
 
   getStepStatus(step) { return this.stepStatus[step]; }
   getVolumeInfo() { return this.volumeInfo; }
@@ -222,10 +234,28 @@ export class InferenceExecutor {
 
     const blob = new Blob([data.niftiData], { type: 'application/octet-stream' });
     const file = new File([blob], `${data.stage}.nii`, { type: 'application/octet-stream' });
+    const spatial = this._tagStageFile(file, data.stage, data.niftiData);
     this.results[data.stage] = {
       file: file,
-      description: data.description
+      description: data.description,
+      spatial
     };
+
+    const nodeId = this.graph.getNodeForStage(data.stage);
+    this.graph.recordArtifact(nodeId, {
+      stage: data.stage,
+      role: data.stage,
+      file,
+      description: data.description,
+      spatial
+    });
+    if (data.stage === 'segmentation') {
+      this.stepStatus.inference = 'complete';
+      this.graph.markNodeComplete('inference', {
+        mode: 'run',
+        params: this.currentStepParams.inference || {}
+      });
+    }
 
     Promise.resolve(this.onStageData(data)).catch(err => {
       console.error('Error handling stage data:', err);
@@ -236,6 +266,22 @@ export class InferenceExecutor {
   _handleBrainMaskOverlay(data) {
     const blob = new Blob([data.niftiData], { type: 'application/octet-stream' });
     this.brainMaskOverlayFile = new File([blob], 'brain-mask.nii', { type: 'application/octet-stream' });
+    const spatial = this._tagStageFile(this.brainMaskOverlayFile, 'brainmask', data.niftiData);
+    if (!this.stageOrder.includes('brainmask')) {
+      this.stageOrder.push('brainmask');
+    }
+    this.results.brainmask = {
+      file: this.brainMaskOverlayFile,
+      description: 'Brain mask',
+      spatial
+    };
+    this.graph.recordArtifact('bet', {
+      stage: 'brainmask',
+      role: 'brainmask',
+      file: this.brainMaskOverlayFile,
+      description: 'Brain mask overlay',
+      spatial
+    });
     if (this.onBrainMaskOverlay) {
       this.onBrainMaskOverlay(this.brainMaskOverlayFile);
     }
@@ -245,6 +291,12 @@ export class InferenceExecutor {
     // Preserve 'skipped' status if already set by skip method
     if (this.stepStatus[step] !== 'skipped') {
       this.stepStatus[step] = 'complete';
+    }
+    if (this.graph.nodes?.has(step)) {
+      this.graph.markNodeComplete(step, {
+        mode: this.stepStatus[step] === 'skipped' ? 'skip' : 'run',
+        params: this.currentStepParams[step] || {}
+      });
     }
     this.running = false;
     if (this.currentRunningStep === step) {
@@ -314,6 +366,7 @@ export class InferenceExecutor {
     this.inputVolumeBuffer = inputData.slice(0);
     this.running = true;
     this.stepStatus.load = 'running';
+    this.graph.setNodeRunning('load', { params: {} });
     this.worker.postMessage(
       { type: 'load', data: { inputData } },
       [inputData]
@@ -322,15 +375,31 @@ export class InferenceExecutor {
 
   async downsample(factor) {
     await this.initialize();
+    this.invalidateFromStep('downsample', { includeSelf: true });
     this.running = true;
     this.stepStatus.downsample = 'running';
-    this.worker.postMessage({ type: 'downsample', data: { factor } });
+    this.currentStepParams.downsample = { factor };
+    this.graph.setNodeRunning('downsample', { params: this.currentStepParams.downsample });
+    const inputData = this.inputVolumeBuffer?.slice(0);
+    if (inputData) {
+      this.worker.postMessage({ type: 'downsample-from-input', data: { inputData, factor } }, [inputData]);
+    } else {
+      this.worker.postMessage({ type: 'downsample', data: { factor } });
+    }
   }
 
   skipDownsample() {
+    this.invalidateFromStep('downsample', { includeSelf: true });
     this.stepStatus.downsample = 'skipped';
+    this.currentStepParams.downsample = { skipped: true };
+    this.graph.markNodeSkipped('downsample', this.currentStepParams.downsample);
     this.running = true;
-    this.worker.postMessage({ type: 'skip-downsample' });
+    const inputData = this.inputVolumeBuffer?.slice(0);
+    if (inputData) {
+      this.worker.postMessage({ type: 'skip-downsample', data: { inputData } }, [inputData]);
+    } else {
+      this.worker.postMessage({ type: 'skip-downsample' });
+    }
   }
 
   async runN4() {
@@ -338,14 +407,20 @@ export class InferenceExecutor {
     if (!this.pendingAbortCheckpoint || this.pendingAbortCheckpoint.step !== 'n4') {
       this.captureCheckpoint('n4');
     }
+    this.invalidateFromStep('n4', { includeSelf: true });
     this.running = true;
     this.currentRunningStep = 'n4';
     this.stepStatus.n4 = 'running';
+    this.currentStepParams.n4 = { skipped: false };
+    this.graph.setNodeRunning('n4', { params: this.currentStepParams.n4 });
     this.worker.postMessage({ type: 'run-n4' });
   }
 
   skipN4() {
+    this.invalidateFromStep('n4', { includeSelf: true });
     this.stepStatus.n4 = 'skipped';
+    this.currentStepParams.n4 = { skipped: true };
+    this.graph.markNodeSkipped('n4', this.currentStepParams.n4);
     this.running = true;
     this.worker.postMessage({ type: 'skip-n4' });
   }
@@ -355,14 +430,20 @@ export class InferenceExecutor {
     if (!this.pendingAbortCheckpoint || this.pendingAbortCheckpoint.step !== 'bet') {
       this.captureCheckpoint('bet');
     }
+    this.invalidateFromStep('bet', { includeSelf: true });
     this.running = true;
     this.currentRunningStep = 'bet';
     this.stepStatus.bet = 'running';
+    this.currentStepParams.bet = { fractionalIntensity, method, modelBaseUrl };
+    this.graph.setNodeRunning('bet', { params: this.currentStepParams.bet });
     this.worker.postMessage({ type: 'run-bet', data: { fractionalIntensity, method, modelBaseUrl } });
   }
 
   skipBET() {
+    this.invalidateFromStep('bet', { includeSelf: true });
     this.stepStatus.bet = 'skipped';
+    this.currentStepParams.bet = { skipped: true };
+    this.graph.markNodeSkipped('bet', this.currentStepParams.bet);
     this.running = true;
     this.worker.postMessage({ type: 'skip-bet' });
   }
@@ -390,14 +471,20 @@ export class InferenceExecutor {
     if (!this.pendingAbortCheckpoint || this.pendingAbortCheckpoint.step !== 'denoise') {
       this.captureCheckpoint('denoise');
     }
+    this.invalidateFromStep('denoise', { includeSelf: true });
     this.running = true;
     this.currentRunningStep = 'denoise';
     this.stepStatus.denoise = 'running';
+    this.currentStepParams.denoise = { method };
+    this.graph.setNodeRunning('denoise', { params: this.currentStepParams.denoise });
     this.worker.postMessage({ type: 'run-denoise', data: { method } });
   }
 
   skipDenoise() {
+    this.invalidateFromStep('denoise', { includeSelf: true });
     this.stepStatus.denoise = 'skipped';
+    this.currentStepParams.denoise = { skipped: true };
+    this.graph.markNodeSkipped('denoise', this.currentStepParams.denoise);
     this.running = true;
     this.worker.postMessage({ type: 'skip-denoise' });
   }
@@ -407,9 +494,12 @@ export class InferenceExecutor {
     if (!this.pendingAbortCheckpoint || this.pendingAbortCheckpoint.step !== 'inference') {
       this.captureCheckpoint('inference');
     }
+    this.invalidateFromStep('inference', { includeSelf: true });
     this.running = true;
     this.currentRunningStep = 'inference';
     this.stepStatus.inference = 'running';
+    this.currentStepParams.inference = { ...settings };
+    this.graph.setNodeRunning('inference', { params: this.currentStepParams.inference });
     this.worker.postMessage({ type: 'run-inference', data: settings });
   }
 
@@ -433,6 +523,9 @@ export class InferenceExecutor {
     this.pendingAbortCheckpoint = null;
     this.restoreStateResolve = null;
     this.restoreStateReject = null;
+    this.graph.reset();
+    this.currentStepParams = {};
+    this.sourceSpatial = null;
   }
 
   captureCheckpoint(step) {
@@ -443,7 +536,10 @@ export class InferenceExecutor {
       results: this._cloneResults(this.results),
       stageOrder: [...this.stageOrder],
       volumeInfo: this.volumeInfo ? { ...this.volumeInfo } : null,
-      hiddenArtifacts: this._cloneHiddenArtifacts(this.hiddenArtifacts)
+      hiddenArtifacts: this._cloneHiddenArtifacts(this.hiddenArtifacts),
+      graph: this.graph.snapshot(),
+      currentStepParams: this._cloneValue(this.currentStepParams),
+      sourceSpatial: this._cloneValue(this.sourceSpatial)
     };
     return this.pendingAbortCheckpoint;
   }
@@ -456,12 +552,16 @@ export class InferenceExecutor {
     const n4ResultData = checkpoint.results.n4?.file
       ? await checkpoint.results.n4.file.arrayBuffer()
       : null;
+    const downsampleResultData = checkpoint.results.downsample?.file
+      ? await checkpoint.results.downsample.file.arrayBuffer()
+      : null;
     const denoiseResultData = checkpoint.results.nlm?.file
       ? await checkpoint.results.nlm.file.arrayBuffer()
       : null;
 
     return {
       inputData: checkpoint.inputBuffer.slice(0),
+      downsampleResultData,
       n4ResultData,
       denoiseResultData,
       hiddenArtifacts: this._cloneHiddenArtifacts(checkpoint.hiddenArtifacts)
@@ -503,6 +603,9 @@ export class InferenceExecutor {
       this.stageOrder = [...checkpoint.stageOrder];
       this.volumeInfo = checkpoint.volumeInfo ? { ...checkpoint.volumeInfo } : null;
       this.hiddenArtifacts = this._cloneHiddenArtifacts(checkpoint.hiddenArtifacts);
+      this.graph.restore(checkpoint.graph);
+      this.currentStepParams = this._cloneValue(checkpoint.currentStepParams || {});
+      this.sourceSpatial = this._cloneValue(checkpoint.sourceSpatial || null);
       this.stepStatus = {
         ...checkpoint.stepStatus,
         [abortedStep]: 'pending'
@@ -526,7 +629,7 @@ export class InferenceExecutor {
 
   // Reset downstream steps when a step is re-run
   resetDownstream(fromStep) {
-    const steps = ['load', 'n4', 'bet', 'denoise', 'inference'];
+    const steps = ['load', 'downsample', 'n4', 'denoise', 'inference', 'bet'];
     const idx = steps.indexOf(fromStep);
     if (idx < 0) return;
     for (let i = idx + 1; i < steps.length; i++) {
@@ -534,6 +637,80 @@ export class InferenceExecutor {
       if (fromStep === 'bet') break;
       this.stepStatus[steps[i]] = 'pending';
     }
+  }
+
+  setSourceFile(file, inputData) {
+    const spatial = readNiftiSpatialMetadata(inputData);
+    this.sourceSpatial = spatial;
+    tagSpatialFile(file, {
+      space: spatial ? VOLUME_SPACES.SOURCE_NATIVE : undefined,
+      role: 'source',
+      sourceStage: 'input',
+      dims: spatial?.dims,
+      affine: spatial?.affine
+    });
+    this.graph.loadSource({
+      file,
+      digest: this._bufferDigest(inputData),
+      spatial: {
+        space: spatial ? VOLUME_SPACES.SOURCE_NATIVE : undefined,
+        dims: spatial?.dims,
+        affine: spatial?.affine
+      }
+    });
+  }
+
+  invalidateFromStep(step, { includeSelf = false } = {}) {
+    const invalidated = this.graph.invalidateFrom(step, { includeSelf });
+    for (const stage of invalidated.stages) {
+      delete this.results[stage];
+    }
+    this.stageOrder = this.stageOrder.filter(stage => !invalidated.stages.includes(stage));
+    for (const node of invalidated.nodes) {
+      if (this.stepStatus[node] !== undefined && node !== 'load') this.stepStatus[node] = 'pending';
+    }
+    return invalidated;
+  }
+
+  _tagStageFile(file, stage, niftiData) {
+    const spatial = readNiftiSpatialMetadata(niftiData);
+    const gridId = spatialGridId(spatial || {});
+    const sameAsSource = this._sameSpatial(spatial, this.sourceSpatial);
+    const metadata = {
+      space: stage === 'input' || sameAsSource ? VOLUME_SPACES.SOURCE_NATIVE : analysisVolumeSpace(gridId),
+      role: stage,
+      sourceStage: stage,
+      dims: spatial?.dims,
+      affine: spatial?.affine
+    };
+    tagSpatialFile(file, metadata);
+    return metadata;
+  }
+
+  _bufferDigest(buffer) {
+    if (!(buffer instanceof ArrayBuffer)) return `source:${Date.now()}`;
+    const bytes = new Uint8Array(buffer);
+    let hash = 0;
+    const stride = Math.max(1, Math.floor(bytes.length / 4096));
+    for (let i = 0; i < bytes.length; i += stride) {
+      hash = ((hash << 5) - hash + bytes[i]) | 0;
+    }
+    hash = ((hash << 5) - hash + bytes.length) | 0;
+    return Math.abs(hash).toString(36);
+  }
+
+  _sameSpatial(a, b) {
+    if (!a?.dims || !b?.dims) return false;
+    if (a.dims.length !== b.dims.length || a.dims.some((value, index) => Number(value) !== Number(b.dims[index]))) {
+      return false;
+    }
+    if (!a.affine || !b.affine) return true;
+    for (let r = 0; r < 4; r++) {
+      for (let c = 0; c < 4; c++) {
+        if (Math.abs(Number(a.affine[r]?.[c]) - Number(b.affine[r]?.[c])) > 1e-3) return false;
+      }
+    }
+    return true;
   }
 
   // ==================== Legacy Methods ====================
@@ -576,6 +753,7 @@ export class InferenceExecutor {
   }
 
   clearResults() {
+    this.invalidateFromStep('downsample', { includeSelf: true });
     this.results = {};
     this.stageOrder = [];
   }
