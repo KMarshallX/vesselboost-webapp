@@ -38,11 +38,11 @@
   <main class="start-main">
     <section class="start-hero">
       <div class="start-hero-copy">
-        <p class="start-kicker">Blood vessel segmentation in the browser</p>
-        <h2>Segment brain vessels locally in your browser.</h2>
+        <p class="start-kicker">Vessel segmentation and review in the browser</p>
+        <h2>Process brain vessel maps locally in your browser.</h2>
         <p class="start-intro">
           VesselBoost guides NIfTI or DICOM angiography data through optional preprocessing,
-          3D UNet vessel segmentation, brain masking, interactive review, and local NIfTI export.
+          3D UNet vessel segmentation, brain masking, interactive review, and reportable local outputs.
         </p>
         <div class="start-actions">
           <button class="btn btn-primary start-primary" id="enterAppButton" type="button">Start analysis</button>
@@ -50,7 +50,7 @@
         </div>
         <p class="start-local-badge">
           <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
-          Patient images, voxel values, screenshots, and generated outputs stay on this computer.
+          Patient images, masks, voxel values, screenshots, and generated outputs stay on this computer.
         </p>
       </div>
 
@@ -58,39 +58,13 @@
         <h3>Local-first workflow</h3>
         <ul>
           <li>Files are read into browser memory for viewing and analysis.</li>
-          <li>Model, runtime, and preprocessing assets may be downloaded when needed.</li>
+          <li>Model, runtime, and preprocessing assets may be downloaded when a workflow needs them.</li>
           <li>Patient-derived files and generated results are not uploaded by the app.</li>
           <li>Background execution is possible if this site is added under "Always keep these sites active" in your browser settings.</li>
         </ul>
       </div>
     </section>
 
-    <section class="start-how" aria-labelledby="startHowHeading">
-      <h3 id="startHowHeading">How It Works</h3>
-      <div class="start-steps">
-        <article class="start-step">
-          <div class="start-step-icon">
-            <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="M17 8l-5-5-5 5"/><path d="M12 3v12"/></svg>
-          </div>
-          <h4>1. Load angiography data</h4>
-          <p>Choose NIfTI or DICOM MRI data. Loading displays the scan; processing starts only when you run a step.</p>
-        </article>
-        <article class="start-step">
-          <div class="start-step-icon">
-            <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>
-          </div>
-          <h4>2. Run vessel analysis</h4>
-          <p>Use optional downsampling, bias correction, denoising, 3D vessel segmentation, and brain extraction controls.</p>
-        </article>
-        <article class="start-step">
-          <div class="start-step-icon">
-            <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v18h18"/><path d="M7 14l4-4 3 3 5-7"/></svg>
-          </div>
-          <h4>3. Review and export</h4>
-          <p>Inspect the image and vessel overlay, tune visibility, capture screenshots, and download NIfTI outputs locally.</p>
-        </article>
-      </div>
-    </section>
   </main>
 </section>
 
