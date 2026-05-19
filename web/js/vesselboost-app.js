@@ -298,6 +298,8 @@ class VesselBoostApp {
     const clearResults = document.getElementById('clearResults');
     if (clearResults) clearResults.addEventListener('click', () => this.clearResults());
 
+    this.bindStartPageControls();
+
     // Modal buttons
     const aboutBtn = document.getElementById('aboutButton');
     if (aboutBtn) aboutBtn.addEventListener('click', () => this.aboutModal.open());
@@ -313,6 +315,33 @@ class VesselBoostApp {
     if (privacyBtn) privacyBtn.addEventListener('click', () => this.privacyModal.open());
     const closePrivacy = document.getElementById('closePrivacy');
     if (closePrivacy) closePrivacy.addEventListener('click', () => this.privacyModal.close());
+  }
+
+  bindStartPageControls() {
+    const enterButton = document.getElementById('enterAppButton');
+    if (enterButton) {
+      enterButton.addEventListener('click', () => this.enterApp());
+    }
+
+    const startPrivacyButton = document.getElementById('startPrivacyButton');
+    if (startPrivacyButton) startPrivacyButton.addEventListener('click', () => this.privacyModal.open());
+
+    const startPrivacyInlineButton = document.getElementById('startPrivacyInlineButton');
+    if (startPrivacyInlineButton) startPrivacyInlineButton.addEventListener('click', () => this.privacyModal.open());
+
+    const startCitationsButton = document.getElementById('startCitationsButton');
+    if (startCitationsButton) startCitationsButton.addEventListener('click', () => this.citationsModal.open());
+  }
+
+  enterApp() {
+    const startPage = document.getElementById('startPage');
+    if (startPage) startPage.classList.add('hidden');
+
+    document.getElementById('fileInput')?.focus();
+    requestAnimationFrame(() => {
+      window.dispatchEvent(new Event('resize'));
+      this.nv.drawScene();
+    });
   }
 
   setupDropZone() {
