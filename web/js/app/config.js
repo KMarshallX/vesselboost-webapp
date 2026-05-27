@@ -1,4 +1,4 @@
-export const VERSION = '2.0.94';
+export const VERSION = '2.0.101';
 
 // Model - relative path (served from same origin)
 export const MODEL_BASE_URL = './models';
@@ -91,6 +91,7 @@ export const STAGE_NAMES = {
   'input': 'Input',
   'downsample': 'Downsample',
   'bet': 'Brain Extraction',
+  'brainmask': 'Brain Mask',
   'n4': 'Bias Correction',
   'nlm': 'Denoising',
   'segmentation': 'Segmentation'

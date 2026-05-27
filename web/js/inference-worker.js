@@ -10,11 +10,12 @@
  *   5. Inference (resample → normalize → crop → sliding window → threshold → CC → inverse)
  */
 
-/* global importScripts, ort, localforage, nifti, wasm_bindgen */
+/* global importScripts, ort, localforage, nifti, wasm_bindgen, VesselBoostN4Policy */
 
 importScripts('../wasm/ort.webgpu.min.js');
 importScripts('https://cdn.jsdelivr.net/npm/localforage@1.10.0/dist/localforage.min.js');
 importScripts('../nifti-js/index.js');
+importScripts('modules/pipeline/n4-shrink-policy.js');
 
 // Preprocessing WASM (optional - loaded if available)
 let wasmPreprocessingAvailable = false;
@@ -41,6 +42,7 @@ let workerState = {
   rasData: null,
   rasDims: null,
   rasSpacing: null,
+  nativeRasSpacing: null,
   brainMask: null,
   denoisedData: null,
   // Unmasked segmentation labels in RAS space (before brain mask / CC cleanup)
@@ -73,6 +75,7 @@ function resetState() {
     rasData: null,
     rasDims: null,
     rasSpacing: null,
+    nativeRasSpacing: null,
     brainMask: null,
     denoisedData: null,
     segLabelsRAS: null,
@@ -1177,6 +1180,7 @@ function loadStateFromInput(inputData, { emitUpdates = false } = {}) {
   if (emitUpdates) {
     postLog(`RAS dims: ${workerState.rasDims.join('x')}`);
   }
+  workerState.nativeRasSpacing = [...workerState.rasSpacing];
 
   // Clear downstream state
   workerState.brainMask = null;
@@ -1201,7 +1205,35 @@ function stepLoad(inputData) {
   postStepComplete('load');
 }
 
+function restorePreDownsampleState() {
+  if (!workerState.preDownsampleData) return false;
+  workerState.rasData = workerState.preDownsampleData;
+  workerState.rasDims = workerState.preDownsampleDims;
+  workerState.rasSpacing = workerState.preDownsampleSpacing;
+  workerState.nativeRasSpacing = workerState.preDownsampleSpacing ? [...workerState.preDownsampleSpacing] : workerState.nativeRasSpacing;
+  workerState.headerBytes = workerState.preDownsampleHeaderBytes;
+  workerState.origDims = workerState.preDownsampleOrigDims;
+  workerState.origHeaderBytes = workerState.preDownsampleOrigHeaderBytes;
+  workerState.perm = workerState.preDownsamplePerm;
+  workerState.flip = workerState.preDownsampleFlip;
+  workerState.isIdentity = workerState.preDownsampleIsIdentity;
+  workerState.preDownsampleData = null;
+  workerState.preDownsampleDims = null;
+  workerState.preDownsampleSpacing = null;
+  workerState.preDownsampleHeaderBytes = null;
+  workerState.preDownsampleOrigDims = null;
+  workerState.preDownsampleOrigHeaderBytes = null;
+  workerState.preDownsamplePerm = null;
+  workerState.preDownsampleFlip = null;
+  workerState.preDownsampleIsIdentity = null;
+  return true;
+}
+
 function stepDownsample(factor) {
+  if (restorePreDownsampleState()) {
+    postLog('Restored original resolution before applying new downsample factor');
+  }
+
   const srcSpacing = workerState.rasSpacing;
   const tgtSpacing = srcSpacing.map(s => s * factor);
   const srcDims = workerState.rasDims;
@@ -1280,6 +1312,19 @@ async function restoreWorkerState(data) {
   resetState();
   loadStateFromInput(data.inputData, { emitUpdates: false });
 
+  if (data.downsampleResultData) {
+    const restoredDownsample = parseNiftiInput(data.downsampleResultData);
+    workerState.rasData = restoredDownsample.imageData;
+    workerState.rasDims = restoredDownsample.dims;
+    workerState.rasSpacing = restoredDownsample.voxelSize;
+    workerState.headerBytes = restoredDownsample.headerBytes;
+    workerState.origDims = [...restoredDownsample.dims];
+    workerState.origHeaderBytes = restoredDownsample.headerBytes.slice(0);
+    workerState.perm = [0, 1, 2];
+    workerState.flip = [false, false, false];
+    workerState.isIdentity = true;
+  }
+
   if (data.n4ResultData) {
     const restoredN4 = parseNiftiInput(data.n4ResultData);
     workerState.rasData = restoredN4.imageData;
@@ -1345,10 +1390,23 @@ function stepN4() {
   // Save backup for skip-undo
   workerState.preN4Data = new Float32Array(rasData);
 
+  const n4Policy = VesselBoostN4Policy.chooseN4ShrinkFactor(
+    rasSpacing,
+    workerState.nativeRasSpacing,
+    rasDims
+  );
+  if (n4Policy.shrinkFactor !== n4Policy.baseShrinkFactor || n4Policy.externalDownsampleFactor > 1.05) {
+    postLog(
+      `N4 shrink factor: ${n4Policy.shrinkFactor} `
+      + `(native-equivalent ${n4Policy.effectiveShrinkFactor.toFixed(2)}x, `
+      + `external downsample ${n4Policy.externalDownsampleFactor.toFixed(2)}x)`
+    );
+  }
+
   const corrected = wasm_bindgen.n4_bias_correct(
     rasData, rasDims[0], rasDims[1], rasDims[2],
     rasSpacing[0], rasSpacing[1], rasSpacing[2],
-    4, 10, 0.005
+    n4Policy.shrinkFactor, 10, 0.005
   );
 
   // Log output stats
@@ -2191,17 +2249,19 @@ self.onmessage = async (e) => {
       }
       break;
 
+    case 'downsample-from-input':
+      try {
+        loadStateFromInput(data.inputData, { emitUpdates: false });
+        stepDownsample(data.factor);
+      } catch (error) {
+        console.error('Downsample error:', error);
+        postError(error?.message || String(error));
+      }
+      break;
+
     case 'skip-downsample':
-      if (workerState.preDownsampleData) {
-        workerState.rasData = workerState.preDownsampleData;
-        workerState.rasDims = workerState.preDownsampleDims;
-        workerState.rasSpacing = workerState.preDownsampleSpacing;
-        workerState.headerBytes = workerState.preDownsampleHeaderBytes;
-        workerState.origDims = workerState.preDownsampleOrigDims;
-        workerState.origHeaderBytes = workerState.preDownsampleOrigHeaderBytes;
-        workerState.perm = workerState.preDownsamplePerm;
-        workerState.flip = workerState.preDownsampleFlip;
-        workerState.isIdentity = workerState.preDownsampleIsIdentity;
+      if (data?.inputData) {
+        loadStateFromInput(data.inputData, { emitUpdates: false });
         workerState.preDownsampleData = null;
         workerState.preDownsampleDims = null;
         workerState.preDownsampleSpacing = null;
@@ -2211,6 +2271,20 @@ self.onmessage = async (e) => {
         workerState.preDownsamplePerm = null;
         workerState.preDownsampleFlip = null;
         workerState.preDownsampleIsIdentity = null;
+        workerState.preN4Data = null;
+        workerState.brainMask = null;
+        workerState.preBETMask = null;
+        workerState.denoisedData = null;
+        workerState.preDenoiseData = null;
+        workerState.segLabelsRAS = null;
+        workerState.segMinComponentSize = 10;
+        postLog('Downsample skipped — restored original resolution');
+        postVolumeInfo({
+          rasDims: [...workerState.rasDims],
+          rasSpacing: [...workerState.rasSpacing],
+          totalSlices: workerState.rasDims[2]
+        });
+      } else if (restorePreDownsampleState()) {
         // Clear downstream state
         workerState.preN4Data = null;
         workerState.brainMask = null;
